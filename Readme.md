@@ -113,7 +113,7 @@ CAIEC has been evaluated on a wide range of scientific domains:
 The following figures compare **end-to-end compression and decompression throughput** of CAIEC with representative AI-based and non-AI GPU compressors across multiple real-world scientific datasets.
 
 <p align="center">
-  <img src="figures/thr_png" width="80%">
+  <img src="figures/thr.png" width="80%">
 </p>
 
 <p align="center">
@@ -152,7 +152,7 @@ We compare CAIEC against representative **non-AI GPU compressors** and **existin
 CAIEC exposes a tunable parameter **P** to control the parallel granularity of GPU entropy coding, enabling explicit trade-offs between throughput and compression efficiency.
 
 <p align="center">
-  <img src="figures/p_gpu.png" width="70%">
+  <img src="figures/p-gpu.png" width="70%">
 </p>
 
 <p align="center">
