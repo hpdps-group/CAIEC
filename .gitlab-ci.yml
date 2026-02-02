@@ -1,0 +1,190 @@
+variables:
+  UV_INSTALL_DIR: "${CI_PROJECT_DIR}/.local/bin"
+  UV_CACHE_DIR: "${CI_PROJECT_DIR}/.uv-cache"
+  UV_LINK_MODE: copy
+
+stages:
+  - setup
+  - build
+  - static-analysis
+  - test
+  - doc
+
+.default-before-script: &default-before-script
+  - export PATH="${UV_INSTALL_DIR}:$PATH"
+  - source "${UV_INSTALL_DIR}/env"
+  - uv run --no-sync python --version
+
+.check-torch-cuda: &check-torch-cuda
+  - |
+    TORCH_VERSION="$TORCH_VERSION" uv run --no-sync python <<EOF
+    import os, torch
+    from packaging import version
+    print(f"{torch.__version__=}\n{torch.version.cuda=}\n{torch.cuda.is_available()=}")
+    expected_torch_version = os.environ["TORCH_VERSION"]
+    assert (
+        version.parse(torch.__version__).base_version
+        == version.parse(expected_torch_version).base_version
+    ), f"Expected torch.__version__={expected_torch_version}, but got {torch.__version__=}"
+    # assert torch.cuda.is_available(), "CUDA is not available"
+    EOF
+
+uv-install:
+  image: python:3.10-buster
+  stage: setup
+  script:
+    - curl -LsSf https://astral.sh/uv/install.sh | sh
+    - *default-before-script
+  artifacts:
+    paths:
+      - ".local/"
+    expire_in: 1 day
+  tags:
+    - docker
+
+wheel:
+  image: python:$PYTHON_VERSION
+  stage: build
+  before_script:
+    # - export UV_PYTHON="$PYTHON_VERSION"
+    - *default-before-script
+  script:
+    - uv build --wheel
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 day
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ['3.8', '3.9', '3.10', '3.11', '3.12']
+  tags:
+    - docker
+
+sdist:
+  image: python:3.10-buster
+  stage: build
+  before_script:
+    - *default-before-script
+  script:
+    - uv build --sdist
+  tags:
+    - docker
+
+ruff-lint:
+  stage: static-analysis
+  image: pytorch/pytorch:2.2.0-cuda11.8-cudnn8-devel
+  before_script:
+    - *default-before-script
+    - uv sync --only-group=dev
+  script:
+    - uv run --no-sync make check-ruff-lint
+  tags:
+    - docker
+
+ruff-format:
+  stage: static-analysis
+  image: python:3.10-buster
+  before_script:
+    - *default-before-script
+    - uv sync --only-group=dev
+  script:
+    - uv run --no-sync make check-ruff-format
+  tags:
+    - docker
+
+ruff-organize-imports:
+  stage: static-analysis
+  image: python:3.10-buster
+  before_script:
+    - *default-before-script
+    - uv sync --only-group=dev
+  script:
+    - uv run --no-sync make check-ruff-organize-imports
+  tags:
+    - docker
+
+test:
+  stage: test
+  image: pytorch/pytorch:$PYTORCH_IMAGE
+  before_script:
+    - *default-before-script
+    - |
+      if [ "$PYTORCH_IMAGE" == "1.13.1-cuda11.6-cudnn8-devel" ]; then
+        CUDA_VERSION_NAME=cu116
+        TORCH_VERSION=1.13.1+cu116
+        TORCHVISION_VERSION=0.14.1+cu116
+      elif [ "$PYTORCH_IMAGE" == "2.2.0-cuda11.8-cudnn8-devel" ]; then
+        CUDA_VERSION_NAME=cu118
+        TORCH_VERSION=2.2.0+cu118
+        TORCHVISION_VERSION=0.17.0+cu118
+      elif [ "$PYTORCH_IMAGE" == "2.7.1-cuda12.8-cudnn9-devel" ]; then
+        CUDA_VERSION_NAME=cu128
+        TORCH_VERSION=2.7.1+cu128
+        TORCHVISION_VERSION=0.22.0+cu128
+      fi
+    - |
+      cat <<EOF >> pyproject.toml.delta
+      [tool.uv]
+      override-dependencies = [
+        "torch==$TORCH_VERSION",
+        "torchvision==$TORCHVISION_VERSION",
+      ]
+
+      [tool.uv.sources]
+      torch = { index = "pytorch-$CUDA_VERSION_NAME" }
+      torchvision = { index = "pytorch-$CUDA_VERSION_NAME" }
+
+      [[tool.uv.index]]
+      name = "pytorch-$CUDA_VERSION_NAME"
+      url = "https://download.pytorch.org/whl/$CUDA_VERSION_NAME"
+      explicit = true
+      EOF
+    - uv pip install tomlkit
+    - |
+      uv run --no-sync python <<EOF
+      from collections.abc import MutableMapping
+      from pathlib import Path
+      import tomlkit
+
+      def update_dict(d, d2):
+          for k, v in d2.items():
+              if k not in d:
+                  d[k] = v
+              elif isinstance(d[k], MutableMapping) and isinstance(v, MutableMapping):
+                  update_dict(d[k], v)
+              else:
+                  d[k] = v
+
+      base = tomlkit.parse(Path("pyproject.toml").read_text())
+      delta = tomlkit.parse(Path("pyproject.toml.delta").read_text())
+      update_dict(base, delta)
+      Path("pyproject.toml").write_text(tomlkit.dumps(base))
+      EOF
+    - uv sync --group=test --reinstall
+    - *check-torch-cuda
+    - |
+      PYTEST_ARGS=(--cov=compressai --capture=no tests)
+      if [ "$CI_COMMIT_BRANCH" != "master" ]; then
+        PYTEST_ARGS+=(-m "not pretrained")
+      fi
+  script:
+    - uv run --no-sync pytest "${PYTEST_ARGS[@]}"
+  parallel:
+    matrix:
+      - PYTORCH_IMAGE:
+          - "1.13.1-cuda11.6-cudnn8-devel"
+          - "2.2.0-cuda11.8-cudnn8-devel"
+  tags:
+    - docker
+
+doc:
+  stage: doc
+  image: pytorch/pytorch:2.2.0-cuda11.8-cudnn8-devel
+  before_script:
+    - *default-before-script
+    - uv sync --group=doc
+    - cd docs
+  script:
+    - uv run --no-sync make html
+  tags:
+    - docker

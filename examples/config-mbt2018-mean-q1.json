@@ -1,0 +1,19 @@
+{
+  "ga": {
+    "inputs": ["input"],
+    "outputs": ["/g_a/g_a.6/Conv_output_0"]
+  },
+  "gs": {
+    "inputs": ["/gaussian_conditional/Add_output_0"],
+    "outputs": ["x_hat"]
+  },
+  "ha": {
+    "inputs": ["/g_a/g_a.6/Conv_output_0"],
+    "outputs": ["/h_a/h_a.4/Conv_output_0"]
+  },
+  "hs": {
+    "inputs": ["/entropy_bottleneck/Transpose_1_output_0"],
+    "outputs": ["/h_s/h_s.4/Conv_output_0"]
+  }
+
+}
