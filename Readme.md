@@ -8,18 +8,6 @@ CAIEC significantly accelerates learned scientific data compression, achieving t
 
 ---
 
-## 📄 Paper
-
-If you use this code, please cite our paper:
-
-> **CAIEC: End-to-End Performance Optimization for AI-Based Scientific Data Compression via Inference-Encoding Co-Design**
-> Wenjing Huang, Yuhan Chen, Bing Lu, Zedong Liu, Hansheng Wang, Yida Gu, Zhuoru Zhang, Zheng Wei, Shiyuan Fu, Jinyang Liu, Guangming Tan, Dingwen Tao
-> *Proceedings of VLDB 2026* (to appear)
-
-*(ArXiv link will be added once available.)*
-
----
-
 ## 🚀 Key Features
 
 CAIEC introduces **system-level optimizations** across the entire learned compression pipeline:
