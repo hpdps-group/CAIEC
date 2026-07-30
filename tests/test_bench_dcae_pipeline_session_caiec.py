@@ -112,10 +112,35 @@ def test_select_target_batches_rejects_empty_source():
         BENCHMARK.select_target_batches([], 1)
 
 
-def test_total_batch_bytes_and_stats():
+def test_total_batch_bytes():
     batches = [torch.zeros(2, 3, dtype=torch.int16), torch.zeros(1, 3, dtype=torch.int16)]
 
     assert BENCHMARK.total_batch_bytes(batches) == 18
-    assert BENCHMARK.stats([3.0, 1.0, 2.0], "latency_ms") == {
-        "latency_ms_mean": 2.0, "latency_ms_min": 1.0, "latency_ms_max": 3.0
-    }
+
+
+def test_compact_result_row_matches_balle_pipeline_schema():
+    row = BENCHMARK.compact_result_row(
+        "cesm", 4, 64, target_batches=8, actual_batches=8,
+        input_bytes=1024 ** 3, compress_ms=[1000.0, 3000.0],
+        decompress_ms=[2000.0, 2000.0],
+    )
+
+    assert list(row) == [
+        "dataset", "quality", "sweep", "ans_variant", "entropy_p",
+        "entropy_p_source", "target_batches", "actual_batches",
+        "padded_input_bytes", "rounds", "compress_pipeline_ms",
+        "decompress_pipeline_ms", "compress_pipeline_gbps",
+        "decompress_pipeline_gbps",
+    ]
+    assert row["dataset"] == "cesm"
+    assert row["quality"] == 4
+    assert row["sweep"] == "mix"
+    assert row["entropy_p"] == 64
+    assert row["entropy_p_source"] == "config_json"
+    assert row["rounds"] == 2
+    assert row["compress_pipeline_ms"] == 2000.0
+    assert row["decompress_pipeline_ms"] == 2000.0
+    assert row["compress_pipeline_gbps"] == 0.5
+    assert row["decompress_pipeline_gbps"] == 0.5
+    assert not any(key.endswith(("_min", "_max")) for key in row)
+    assert not any("session_create" in key for key in row)
