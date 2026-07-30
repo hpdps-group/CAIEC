@@ -7,7 +7,12 @@ import torch
 from .base import CnnEngine
 from ..codecs.compress_packed_gpu import GpuPackedEntropyCodec
 from compressai.models import TCM
-from compressai.entropy_models import _gpu_ans_encode_with_indexes_tight, _gpu_ans_decode_with_indexes_tight
+from compressai.entropy_models import (
+    _gpu_ans_encode_with_indexes_tight,
+    _gpu_ans_decode_with_indexes_tight,
+    _gpu_ans_encode_with_indexes_warp,
+    _gpu_ans_decode_with_indexes_warp,
+)
 
 
 class TCMEngine(CnnEngine):
@@ -193,7 +198,12 @@ class TCMEngine(CnnEngine):
             indexes_i32   = self._ensure_cuda_contiguous(indexes_i32)
 
             # ---- per-slice tight encode (batch-parallel) ----
-            tight = _gpu_ans_encode_with_indexes_tight(
+            encode_fn = (
+                _gpu_ans_encode_with_indexes_warp
+                if getattr(self.codec, "use_warp", False)
+                else _gpu_ans_encode_with_indexes_tight
+            )
+            tight = encode_fn(
                 y_q_slice_i32,          # CUDA int32 [B,Cs,H,W]
                 indexes_i32,            # CUDA int32 [B,Cs,H,W]
                 cdfs_i32, cdf_sizes_i32, offsets_i32,
@@ -323,10 +333,15 @@ class TCMEngine(CnnEngine):
 
             # ---- decode this slice from the SAME y stream ----
             tight_i = y_strings[slice_index]
-            
-            y_q = _gpu_ans_decode_with_indexes_tight(
-                tight_i, indexes, cdfs_i32, cdf_sizes_i32, offsets_i32
-            )
+
+            if hasattr(tight_i, 'max_rounds_u32'):  # TightWarpANS
+                y_q = _gpu_ans_decode_with_indexes_warp(
+                    tight_i, indexes, cdfs_i32, cdf_sizes_i32, offsets_i32
+                )
+            else:
+                y_q = _gpu_ans_decode_with_indexes_tight(
+                    tight_i, indexes, cdfs_i32, cdf_sizes_i32, offsets_i32
+                )
             B = int(indexes.size(0))
             y_q = y_q.reshape(B, -1, y_shape[0], y_shape[1])
             y_hat_slice = self.codec.gaussian_conditional.dequantize(y_q, mu_in)
@@ -503,7 +518,12 @@ class TCMEngine(CnnEngine):
 
             # ===== codec part: tight encode =====
             start.record()
-            tight = _gpu_ans_encode_with_indexes_tight(
+            encode_fn = (
+                _gpu_ans_encode_with_indexes_warp
+                if getattr(self.codec, "use_warp", False)
+                else _gpu_ans_encode_with_indexes_tight
+            )
+            tight = encode_fn(
                 y_q_slice_i32,
                 indexes_i32,
                 cdfs_i32, cdf_sizes_i32, offsets_i32,
@@ -656,9 +676,14 @@ class TCMEngine(CnnEngine):
             # ===== codec: tight decode =====
             tight_i = y_strings[slice_index]
             start.record()
-            y_q = _gpu_ans_decode_with_indexes_tight(
-                tight_i, indexes, cdfs_i32, cdf_sizes_i32, offsets_i32
-            )
+            if hasattr(tight_i, 'max_rounds_u32'):  # TightWarpANS
+                y_q = _gpu_ans_decode_with_indexes_warp(
+                    tight_i, indexes, cdfs_i32, cdf_sizes_i32, offsets_i32
+                )
+            else:
+                y_q = _gpu_ans_decode_with_indexes_tight(
+                    tight_i, indexes, cdfs_i32, cdf_sizes_i32, offsets_i32
+                )
             end.record()
             torch.cuda.synchronize()
             codec_ms += float(start.elapsed_time(end))

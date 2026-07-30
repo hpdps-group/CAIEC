@@ -23,13 +23,13 @@ class RuntimeConfig:
     h_mean_s_input_dtype: Optional[torch.dtype] = None
     h_scale_s_input_dtype: Optional[torch.dtype] = None
 
-    atten_mean_input_dtypes: Optional[List[torch.dtype]] = None,
-    atten_scale_input_dtypes: Optional[List[torch.dtype]] = None,
-    cc_mean_input_dtypes: Optional[List[torch.dtype]] = None,
-    cc_scale_input_dtypes: Optional[List[torch.dtype]] = None,
-    lrp_input_dtypes: Optional[List[torch.dtype]] = None,
+    atten_mean_input_dtypes: Optional[List[torch.dtype]] = None
+    atten_scale_input_dtypes: Optional[List[torch.dtype]] = None
+    cc_mean_input_dtypes: Optional[List[torch.dtype]] = None
+    cc_scale_input_dtypes: Optional[List[torch.dtype]] = None
+    lrp_input_dtypes: Optional[List[torch.dtype]] = None
     
     # ---- DCAE 新增 dtype 配置（默认 None，不影响旧模型）----
     h_z_s1_input_dtype: Optional[torch.dtype] = None
     h_z_s2_input_dtype: Optional[torch.dtype] = None
-    dt_ca_input_dtypes: Optional[List[torch.dtype]] = None,
+    dt_ca_input_dtypes: Optional[List[torch.dtype]] = None

@@ -92,13 +92,30 @@ class PackedANS:
 @dataclass
 class TightANS:
     packed: torch.Tensor         # CUDA uint8 [total_bytes]
-    sizes_u16: torch.Tensor      # CUDA uint16 [B,K]  # <- 这里
+    sizes_u32: torch.Tensor      # CUDA uint32 [B,K]  (chunk sizes in uint32 words)
     header_bytes_cpu: torch.Tensor
     chunk_len_cpu: torch.Tensor
-    P_cpu: torch.Tensor          # fast: Pch, generic: K（仅用于记录/兼容）
+    P_cpu: torch.Tensor          # fast: Pch, generic: K
 
     def __len__(self):
-        return int(self.sizes_u16.size(0))
+        return int(self.sizes_u32.size(0))
+
+@dataclass
+class TightWarpANS:
+    """WarpANS interleaved encoding result.
+
+    Uses 32-lane warp-level parallelism. Each chunk stores:
+      - max_rounds: max words per lane across all 32 lanes
+      - interleaved payload: max_rounds * 32 words (128-byte aligned)
+    """
+    packed: torch.Tensor            # CUDA uint8 [total_bytes]
+    max_rounds_u32: torch.Tensor    # CUDA uint32 [B,K] — max words per lane per chunk
+    header_bytes_cpu: torch.Tensor  # CPU int64 [1]
+    chunk_len_cpu: torch.Tensor     # CPU int32 [1]
+    P_cpu: torch.Tensor             # CPU int32 [1]
+
+    def __len__(self):
+        return int(self.max_rounds_u32.size(0))
 
 def _require_cuda_i32_contig(x: torch.Tensor, name: str) -> torch.Tensor:
     if not x.is_cuda:
@@ -127,10 +144,40 @@ def _gpu_ans_encode_with_indexes_tight(
     sym_bxn = symbols_i32.reshape(B, -1)  # view/reshape only
     idx_bxn = indexes_i32.reshape(B, -1)
 
-    packed_u8, sizes_u16, header_bytes_cpu, chunk_len_cpu, P_cpu = ans_gpu.encode_with_indexes_tight(
+    packed_u8, sizes_u32, header_bytes_cpu, chunk_len_cpu, P_cpu = ans_gpu.encode_with_indexes_tight(
         sym_bxn, idx_bxn, cdfs_i32, cdf_sizes_i32, offsets_i32, int(parallelism)
     )
-    return TightANS(packed_u8, sizes_u16, header_bytes_cpu, chunk_len_cpu, P_cpu)
+    return TightANS(packed_u8, sizes_u32, header_bytes_cpu, chunk_len_cpu, P_cpu)
+
+def _gpu_ans_encode_with_indexes_warp(
+    symbols_i32: torch.Tensor,      # CUDA int32, contiguous, shape [B, ...]
+    indexes_i32: torch.Tensor,      # CUDA int32, contiguous, shape [B, ...] (same numel)
+    cdfs_i32: torch.Tensor,         # CUDA int32 contiguous [M,Lmax]
+    cdf_sizes_i32: torch.Tensor,    # CUDA int32 contiguous [M]
+    offsets_i32: torch.Tensor,      # CUDA int32 contiguous [M]
+    parallelism: int = 256,
+) -> TightWarpANS:
+    """WarpANS 32-lane interleaved encode.
+
+    Uses one warp (32 threads) per chunk, with interleaved payload format.
+    Recommended P >= 256 for optimal parallelism.
+    """
+    symbols_i32 = _require_cuda_i32_contig(symbols_i32, "symbols_i32")
+    indexes_i32 = _require_cuda_i32_contig(indexes_i32, "indexes_i32")
+    cdfs_i32 = _require_cuda_i32_contig(cdfs_i32, "cdfs_i32")
+    cdf_sizes_i32 = _require_cuda_i32_contig(cdf_sizes_i32, "cdf_sizes_i32")
+    offsets_i32 = _require_cuda_i32_contig(offsets_i32, "offsets_i32")
+
+    B = symbols_i32.size(0)
+    sym_bxn = symbols_i32.reshape(B, -1)
+    idx_bxn = indexes_i32.reshape(B, -1)
+
+    packed_u8, max_rounds_u32, header_bytes_cpu, chunk_len_cpu, P_cpu = (
+        ans_gpu.encode_with_indexes_warp(
+            sym_bxn, idx_bxn, cdfs_i32, cdf_sizes_i32, offsets_i32, int(parallelism)
+        )
+    )
+    return TightWarpANS(packed_u8, max_rounds_u32, header_bytes_cpu, chunk_len_cpu, P_cpu)
 
 def _gpu_ans_decode_with_indexes_tight(
     packed: TightANS,
@@ -149,7 +196,7 @@ def _gpu_ans_decode_with_indexes_tight(
 
     out_sym = ans_gpu.decode_with_indexes_tight(
         packed.packed,
-        packed.sizes_u16,
+        packed.sizes_u32,
         packed.header_bytes_cpu,
         packed.chunk_len_cpu,
         packed.P_cpu,
@@ -157,6 +204,134 @@ def _gpu_ans_decode_with_indexes_tight(
         cdfs_i32,
         cdf_sizes_i32,
         offsets_i32,
+    )
+    return out_sym
+
+def _gpu_ans_decode_with_indexes_warp(
+    packed: TightWarpANS,
+    indexes_i32: torch.Tensor,      # CUDA int32 contiguous [B,...]
+    cdfs_i32: torch.Tensor,         # CUDA int32 contiguous
+    cdf_sizes_i32: torch.Tensor,    # CUDA int32 contiguous
+    offsets_i32: torch.Tensor,      # CUDA int32 contiguous
+) -> torch.Tensor:
+    """WarpANS 32-lane interleaved decode."""
+    indexes_i32 = _require_cuda_i32_contig(indexes_i32, "indexes_i32")
+    cdfs_i32 = _require_cuda_i32_contig(cdfs_i32, "cdfs_i32")
+    cdf_sizes_i32 = _require_cuda_i32_contig(cdf_sizes_i32, "cdf_sizes_i32")
+    offsets_i32 = _require_cuda_i32_contig(offsets_i32, "offsets_i32")
+
+    B = indexes_i32.size(0)
+    idx_bxn = indexes_i32.reshape(B, -1)
+
+    out_sym = ans_gpu.decode_with_indexes_warp(
+        packed.packed,
+        packed.max_rounds_u32,
+        packed.header_bytes_cpu,
+        packed.chunk_len_cpu,
+        packed.P_cpu,
+        idx_bxn,
+        cdfs_i32,
+        cdf_sizes_i32,
+        offsets_i32,
+    )
+    return out_sym
+
+
+def _gpu_ans_encode_with_indexes_warp_v2(
+    symbols_i32: torch.Tensor,
+    indexes_i32: torch.Tensor,
+    cdfs_i32: torch.Tensor,
+    cdf_sizes_i32: torch.Tensor,
+    offsets_i32: torch.Tensor,
+    parallelism: int = 256,
+) -> TightWarpANS:
+    """WarpANS V2: 32-lane interleaved + strength-reduced division (__umul64hi).
+
+    Identical to V1 except Rans64EncPut uses precomputed magic numbers
+    instead of 64-bit integer division.
+    """
+    symbols_i32 = _require_cuda_i32_contig(symbols_i32, "symbols_i32")
+    indexes_i32 = _require_cuda_i32_contig(indexes_i32, "indexes_i32")
+    cdfs_i32 = _require_cuda_i32_contig(cdfs_i32, "cdfs_i32")
+    cdf_sizes_i32 = _require_cuda_i32_contig(cdf_sizes_i32, "cdf_sizes_i32")
+    offsets_i32 = _require_cuda_i32_contig(offsets_i32, "offsets_i32")
+
+    B = symbols_i32.size(0)
+    sym_bxn = symbols_i32.reshape(B, -1)
+    idx_bxn = indexes_i32.reshape(B, -1)
+
+    packed_u8, max_rounds_u32, header_bytes_cpu, chunk_len_cpu, P_cpu = (
+        ans_gpu.encode_with_indexes_warp_v2(
+            sym_bxn, idx_bxn, cdfs_i32, cdf_sizes_i32, offsets_i32, int(parallelism)
+        )
+    )
+    return TightWarpANS(packed_u8, max_rounds_u32, header_bytes_cpu, chunk_len_cpu, P_cpu)
+
+
+def _gpu_ans_decode_with_indexes_warp_v2(
+    packed: TightWarpANS,
+    indexes_i32: torch.Tensor,
+    cdfs_i32: torch.Tensor,
+    cdf_sizes_i32: torch.Tensor,
+    offsets_i32: torch.Tensor,
+) -> torch.Tensor:
+    """WarpANS V2 decode — uses V1 C++ decode (no division in decode path)."""
+    # V2 decode is identical to V1: no division in Rans64DecAdvance.
+    return _gpu_ans_decode_with_indexes_warp(
+        packed, indexes_i32, cdfs_i32, cdf_sizes_i32, offsets_i32)
+
+
+def _gpu_ans_encode_with_indexes_warp_v3(
+    symbols_i32: torch.Tensor,
+    indexes_i32: torch.Tensor,
+    cdfs_i32: torch.Tensor,
+    cdf_sizes_i32: torch.Tensor,
+    offsets_i32: torch.Tensor,
+    parallelism: int = 256,
+) -> TightWarpANS:
+    """WarpANS V3: V2 + shared memory CDF cache.
+
+    CDF tables loaded into __shared__ memory before the encode loop,
+    eliminating per-symbol global memory reads. Otherwise identical to V2.
+    """
+    symbols_i32 = _require_cuda_i32_contig(symbols_i32, "symbols_i32")
+    indexes_i32 = _require_cuda_i32_contig(indexes_i32, "indexes_i32")
+    cdfs_i32 = _require_cuda_i32_contig(cdfs_i32, "cdfs_i32")
+    cdf_sizes_i32 = _require_cuda_i32_contig(cdf_sizes_i32, "cdf_sizes_i32")
+    offsets_i32 = _require_cuda_i32_contig(offsets_i32, "offsets_i32")
+
+    B = symbols_i32.size(0)
+    sym_bxn = symbols_i32.reshape(B, -1)
+    idx_bxn = indexes_i32.reshape(B, -1)
+
+    packed_u8, max_rounds_u32, header_bytes_cpu, chunk_len_cpu, P_cpu = (
+        ans_gpu.encode_with_indexes_warp_v3(
+            sym_bxn, idx_bxn, cdfs_i32, cdf_sizes_i32, offsets_i32, int(parallelism)
+        )
+    )
+    return TightWarpANS(packed_u8, max_rounds_u32, header_bytes_cpu, chunk_len_cpu, P_cpu)
+
+
+def _gpu_ans_decode_with_indexes_warp_v3(
+    packed: TightWarpANS,
+    indexes_i32: torch.Tensor,
+    cdfs_i32: torch.Tensor,
+    cdf_sizes_i32: torch.Tensor,
+    offsets_i32: torch.Tensor,
+) -> torch.Tensor:
+    """WarpANS V3 decode — shared memory CDF cache."""
+    indexes_i32 = _require_cuda_i32_contig(indexes_i32, "indexes_i32")
+    cdfs_i32 = _require_cuda_i32_contig(cdfs_i32, "cdfs_i32")
+    cdf_sizes_i32 = _require_cuda_i32_contig(cdf_sizes_i32, "cdf_sizes_i32")
+    offsets_i32 = _require_cuda_i32_contig(offsets_i32, "offsets_i32")
+
+    B = indexes_i32.size(0)
+    idx_bxn = indexes_i32.reshape(B, -1)
+
+    out_sym = ans_gpu.decode_with_indexes_warp_v3(
+        packed.packed, packed.max_rounds_u32,
+        packed.header_bytes_cpu, packed.chunk_len_cpu, packed.P_cpu,
+        idx_bxn, cdfs_i32, cdf_sizes_i32, offsets_i32,
     )
     return out_sym
 
@@ -350,34 +525,35 @@ class EntropyModel(nn.Module):
         
         # --- GPU fast path (optional) ---
         use_gpu_ans = getattr(self, "use_gpu_ans", False)
-        # use_gpu_ans = use_gpu_ans or (os.getenv("COMPRESSAI_USE_GPU_ANS", "0") == "1")
 
         if use_gpu_ans:
-            # symbols_bin = symbols.detach().cpu().numpy()
-            # # symbols_bin.tofile("/hwj/project/caiec-script/latent_data/nyx/Y_symbols.bin")
-            # print(symbols_bin.shape)
-            
-            # indexes_bin = indexes.detach().cpu().numpy()
-            # # indexes_bin.tofile("/hwj/project/caiec-script/latent_data/nyx/Y_index.bin")
-            # print(indexes_bin.shape)
-            
-            # cdf_bin = self._quantized_cdf.detach().cpu().numpy()
-            # # cdf_bin.tofile("/hwj/project/caiec-script/latent_data/nyx/Y_cdf.bin")
-            # print(cdf_bin.shape)
-            
-            # cdfsize_bin = self._cdf_length.detach().cpu().numpy()
-            # # cdfsize_bin.tofile("/hwj/project/caiec-script/latent_data/nyx/Y_cdfsize.bin")
-            # print(cdfsize_bin.shape)
-            
-            # offsets_bin = self._offset.detach().cpu().numpy()
-            # # offsets_bin.tofile("/hwj/project/caiec-script/latent_data/nyx/Y_offsets.bin")
-            # print(offsets_bin.shape)
+            parallelism = getattr(self, "gpu_ans_parallelism", 64)
+            variant = getattr(self, "ans_variant", "tight")
 
-            return _gpu_ans_encode_with_indexes_tight(
-                symbols, indexes,
-                self._quantized_cdf, self._cdf_length, self._offset,
-                parallelism=getattr(self, "gpu_ans_parallelism", 64),
-            )
+            if variant == "warp_smem":
+                return _gpu_ans_encode_with_indexes_warp_v3(
+                    symbols, indexes,
+                    self._quantized_cdf, self._cdf_length, self._offset,
+                    parallelism=parallelism,
+                )
+            elif variant == "warp_div":
+                return _gpu_ans_encode_with_indexes_warp_v2(
+                    symbols, indexes,
+                    self._quantized_cdf, self._cdf_length, self._offset,
+                    parallelism=parallelism,
+                )
+            elif variant == "warp":
+                return _gpu_ans_encode_with_indexes_warp(
+                    symbols, indexes,
+                    self._quantized_cdf, self._cdf_length, self._offset,
+                    parallelism=parallelism,
+                )
+            else:
+                return _gpu_ans_encode_with_indexes_tight(
+                    symbols, indexes,
+                    self._quantized_cdf, self._cdf_length, self._offset,
+                    parallelism=parallelism,
+                )
 
 
         strings = []
@@ -442,17 +618,43 @@ class EntropyModel(nn.Module):
             means (torch.Tensor, optional): optional tensor means
         """
         use_gpu_ans = getattr(self, "use_gpu_ans", False)
-        
+
         if use_gpu_ans:
-            if not isinstance(strings, TightANS):
-                raise ValueError("GPU-only decode expects TightANS from compress(). Set use_gpu_ans_tight=True consistently.")
-            out_sym = _gpu_ans_decode_with_indexes_tight(
-                strings, indexes,
-                self._quantized_cdf, self._cdf_length, self._offset,
+            variant = getattr(self, "ans_variant", "tight")
+
+            # WarpANS paths (v1/v2/v3 all produce TightWarpANS)
+            if isinstance(strings, TightWarpANS):
+                if variant == "warp_smem":
+                    out_sym = _gpu_ans_decode_with_indexes_warp_v3(
+                        strings, indexes,
+                        self._quantized_cdf, self._cdf_length, self._offset,
+                    )
+                elif variant == "warp_div":
+                    out_sym = _gpu_ans_decode_with_indexes_warp_v2(
+                        strings, indexes,
+                        self._quantized_cdf, self._cdf_length, self._offset,
+                    )
+                else:
+                    out_sym = _gpu_ans_decode_with_indexes_warp(
+                        strings, indexes,
+                        self._quantized_cdf, self._cdf_length, self._offset,
+                    )
+                outputs = out_sym.reshape(indexes.size()).to(dtype=torch.int32)
+                outputs = self.dequantize(outputs, means, dtype)
+                return outputs
+            # Legacy tight path
+            if isinstance(strings, TightANS):
+                out_sym = _gpu_ans_decode_with_indexes_tight(
+                    strings, indexes,
+                    self._quantized_cdf, self._cdf_length, self._offset,
+                )
+                outputs = out_sym.reshape(indexes.size()).to(dtype=torch.int32)
+                outputs = self.dequantize(outputs, means, dtype)
+                return outputs
+            raise ValueError(
+                "GPU-only decode expects TightANS or TightWarpANS from compress(). "
+                "Set use_gpu_ans=True consistently."
             )
-            outputs = out_sym.reshape(indexes.size()).to(dtype=torch.int32)
-            outputs = self.dequantize(outputs, means, dtype)
-            return outputs
 
         if not isinstance(strings, (tuple, list)):
             raise ValueError("Invalid `strings` parameter type.")

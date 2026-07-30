@@ -22,19 +22,41 @@ class GpuPackedEntropyCodec(Codec):
     """
     GPU PackedANS codec for CompressAI EntropyModel.
     - Enforces FP32 input latent for lossless coding.
-    - Handles stream synchronization internally (TRT stream <-> default stream),
-      since EB implementations often assume default stream.
+    - Supports all GA-ANS variants: tight, warp, warp_div, warp_smem.
+    - If ans_variant is not set, auto-enables WarpANS when P >= 256.
     """
 
-    def __init__(self, entropy_bottleneck, gaussian_conditional=None, P: int = 64, error: float = None, latent_norm: bool = False):
+    # Threshold above which WarpANS is automatically enabled (legacy auto mode)
+    WARP_THRESHOLD = 256
+
+    # Valid variant names
+    VARIANTS = ("tight", "warp", "warp_div", "warp_smem")
+
+    def __init__(self, entropy_bottleneck, gaussian_conditional=None,
+                 P: int = 64, error: float = None, latent_norm: bool = False,
+                 ans_variant: str = "auto"):
         self.P = int(P)
+        if ans_variant == "auto":
+            self.use_warp = (self.P >= self.WARP_THRESHOLD)
+            self._variant = "warp" if self.use_warp else "tight"
+        elif ans_variant in self.VARIANTS:
+            self._variant = ans_variant
+            self.use_warp = (ans_variant != "tight")
+        else:
+            raise ValueError(f"ans_variant must be one of {self.VARIANTS} or 'auto', got '{ans_variant}'")
+
+        # EB setup
         self.eb = entropy_bottleneck
         self.eb.use_gpu_ans = True
         self.eb.gpu_ans_parallelism = int(P)
+        self.eb.ans_variant = self._variant
+
+        # GC setup
         self.gaussian_conditional = gaussian_conditional
         if self.gaussian_conditional is not None:
             self.gaussian_conditional.use_gpu_ans = True
             self.gaussian_conditional.gpu_ans_parallelism = int(P)
+            self.gaussian_conditional.ans_variant = self._variant
 
     @torch.no_grad()
     def compress(self, y_fp32: torch.Tensor, params=None, means = None, error=None, min_val=None, max_val=None) -> Pack:

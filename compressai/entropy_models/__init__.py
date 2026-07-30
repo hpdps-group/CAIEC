@@ -34,6 +34,12 @@ from .entropy_models import (
     GaussianMixtureConditional,
     _gpu_ans_encode_with_indexes_tight,
     _gpu_ans_decode_with_indexes_tight,
+    _gpu_ans_encode_with_indexes_warp,
+    _gpu_ans_decode_with_indexes_warp,
+    _gpu_ans_encode_with_indexes_warp_v2,
+    _gpu_ans_decode_with_indexes_warp_v2,
+    _gpu_ans_encode_with_indexes_warp_v3,
+    _gpu_ans_decode_with_indexes_warp_v3,
 )
 from .entropy_models_vbr import EntropyBottleneckVbr, EntropyModelVbr
 
@@ -44,6 +50,12 @@ __all__ = [
     "GaussianMixtureConditional",
     "EntropyModelVbr",
     "EntropyBottleneckVbr",
-    "_gpu_ans_encode_with_indexes_tight", 
-    "_gpu_ans_decode_with_indexes_tight"
+    "_gpu_ans_encode_with_indexes_tight",
+    "_gpu_ans_decode_with_indexes_tight",
+    "_gpu_ans_encode_with_indexes_warp",
+    "_gpu_ans_decode_with_indexes_warp",
+    "_gpu_ans_encode_with_indexes_warp_v2",
+    "_gpu_ans_decode_with_indexes_warp_v2",
+    "_gpu_ans_encode_with_indexes_warp_v3",
+    "_gpu_ans_decode_with_indexes_warp_v3",
 ]
