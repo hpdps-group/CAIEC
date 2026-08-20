@@ -45,9 +45,10 @@ extern __global__ void warp_encode_chunks_kernel_v3(
     const int32_t* __restrict__ symbols_bxn,
     const int32_t* __restrict__ indexes_bxn,
     int B, int N,
-    const int32_t* __restrict__ cdfs_mxl, int Lmax,
+    const int32_t* __restrict__ cdfs_mxl, int Lmax, int C,
     const int32_t* __restrict__ cdf_sizes_m,
     const int32_t* __restrict__ offsets_m,
+    int compact_cdf_entries,
     int K, int chunk_len, int HW,
     uint8_t* __restrict__ arena_u8,
     int64_t stride, int64_t header_bytes_padded,
@@ -89,9 +90,10 @@ extern __global__ void warp_decode_chunks_kernel_v3(
     const int32_t* __restrict__ max_rounds_flat,
     int B, int K, int N, int chunk_len,
     const int32_t* __restrict__ indexes_bxn,
-    const int32_t* __restrict__ cdfs_mxl, int Lmax,
+    const int32_t* __restrict__ cdfs_mxl, int Lmax, int C,
     const int32_t* __restrict__ cdf_sizes_m,
     const int32_t* __restrict__ offsets_m,
+    int compact_cdf_entries,
     int32_t* __restrict__ out_symbols_bxn,
     int fast_idx_is_channel, int HW);
 
@@ -201,6 +203,7 @@ void ans_encode_launch(
     auto stream = at::cuda::getDefaultCUDAStream();
 
     int B = s.B, N = s.N, K = s.K, Lmax = s.Lmax;
+    int C = (int)s.cdfs.size(0);
     int chunk_len = s.chunk_len, HW = s.HW;
     int cap_words_per_lane = s.cap_words_per_lane;
     int fast_idx = s.fast_idx_is_channel;
@@ -210,8 +213,8 @@ void ans_encode_launch(
     if (fast_idx) {
         warp_encode_chunks_kernel_v3<<<dim3(B, K, 1), kWarpLanes, s.smem_bytes, stream>>>(
             symbols_bxn.data_ptr<int32_t>(), indexes_bxn.data_ptr<int32_t>(), B, N,
-            s.cdfs.data_ptr<int32_t>(), Lmax, s.cdf_sizes.data_ptr<int32_t>(),
-            s.offsets.data_ptr<int32_t>(), K, chunk_len, HW,
+            s.cdfs.data_ptr<int32_t>(), Lmax, C, s.cdf_sizes.data_ptr<int32_t>(),
+            s.offsets.data_ptr<int32_t>(), 0, K, chunk_len, HW,
             s.arena_u8.data_ptr<uint8_t>(), s.arena_stride, s.temp_header_padded,
             cap_words_per_lane, s.lane_counts.data_ptr<int32_t>(),
             s.max_rounds.data_ptr<int32_t>(), s.magic_table.data_ptr<uint64_t>(),
@@ -368,6 +371,7 @@ void ans_decode_launch(
     auto stream = at::cuda::getDefaultCUDAStream();
 
     int B = s.B, N = s.N, K = s.K, Lmax = s.Lmax;
+    int C = (int)s.cdfs.size(0);
     int chunk_len = s.chunk_len, HW = s.HW;
 
     int fast_idx = s.fast_idx_is_channel;
@@ -395,8 +399,9 @@ void ans_decode_launch(
             packed_u8.data_ptr<uint8_t>(), header_bytes,
             s.offsets_u32.data_ptr<uint32_t>(), s.max_rounds_i32.data_ptr<int32_t>(),
             B, K, N, chunk_len, indexes_bxn.data_ptr<int32_t>(),
-            s.cdfs.data_ptr<int32_t>(), Lmax, s.cdf_sizes.data_ptr<int32_t>(),
-            s.offsets.data_ptr<int32_t>(), s.output.data_ptr<int32_t>(), fast_idx, HW);
+            s.cdfs.data_ptr<int32_t>(), Lmax, C, s.cdf_sizes.data_ptr<int32_t>(),
+            s.offsets.data_ptr<int32_t>(), 0,
+            s.output.data_ptr<int32_t>(), fast_idx, HW);
     } else {
         warp_decode_chunks_kernel<<<dim3(B, K, 1), kWarpLanes, 0, stream>>>(
             packed_u8.data_ptr<uint8_t>(), header_bytes,

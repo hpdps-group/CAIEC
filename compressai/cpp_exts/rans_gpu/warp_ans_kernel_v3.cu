@@ -54,9 +54,10 @@ __global__ void warp_encode_chunks_kernel_v3(
     const int32_t* __restrict__ symbols_bxn,
     const int32_t* __restrict__ indexes_bxn,
     int B, int N,
-    const int32_t* __restrict__ cdfs_mxl, int Lmax,
+    const int32_t* __restrict__ cdfs_mxl, int Lmax, int C,
     const int32_t* __restrict__ cdf_sizes_m,
     const int32_t* __restrict__ offsets_m,
+    int compact_cdf_entries,
     int K, int chunk_len, int HW,
     uint8_t* __restrict__ arena_u8,
     int64_t stride, int64_t header_bytes_padded,
@@ -68,12 +69,16 @@ __global__ void warp_encode_chunks_kernel_v3(
 ) {
     // ---- Dynamic shared memory ----
     extern __shared__ int32_t smem[];
-    int Pch = chunk_len / HW;
+    int Pch = fast_idx_is_channel ? chunk_len / HW : 0;
 
-    // Layout: cdfs[Pch][Lmax] | cdf_sizes[Pch] | offsets[Pch]
-    int32_t* cdf_cache       = smem;
-    int32_t* cdf_sizes_cache = smem + Pch * Lmax;
-    int32_t* offsets_cache   = cdf_sizes_cache + Pch;
+    // Channel mode caches Pch padded rows. Dynamic-index mode caches every
+    // CDF at its actual length, followed by starts, sizes, and offsets.
+    int32_t* cdf_cache = smem;
+    int32_t* cdf_starts_cache = fast_idx_is_channel
+        ? nullptr : cdf_cache + compact_cdf_entries;
+    int32_t* cdf_sizes_cache = fast_idx_is_channel
+        ? cdf_cache + Pch * Lmax : cdf_starts_cache + C;
+    int32_t* offsets_cache = cdf_sizes_cache + (fast_idx_is_channel ? Pch : C);
 
     int b = (int)blockIdx.x;
     int chunk_id = (int)blockIdx.y;
@@ -91,17 +96,37 @@ __global__ void warp_encode_chunks_kernel_v3(
     if (end > N) end = N;
 
     // ---- Phase 1: cooperative load CDFs into shared memory ----
-    int total_entries = Pch * Lmax;
-    for (int idx = lane; idx < total_entries; idx += kWarpLanes) {
-        int ch = idx / Lmax;
-        int entry = idx % Lmax;
-        int global_ch = chunk_id * Pch + ch;
-        cdf_cache[idx] = cdfs_mxl[global_ch * Lmax + entry];
-    }
-    for (int ch = lane; ch < Pch; ch += kWarpLanes) {
-        int global_ch = chunk_id * Pch + ch;
-        cdf_sizes_cache[ch] = cdf_sizes_m[global_ch];
-        offsets_cache[ch]   = offsets_m[global_ch];
+    if (fast_idx_is_channel) {
+        int total_entries = Pch * Lmax;
+        for (int idx = lane; idx < total_entries; idx += kWarpLanes) {
+            int ch = idx / Lmax;
+            int entry = idx % Lmax;
+            int global_ch = chunk_id * Pch + ch;
+            cdf_cache[idx] = cdfs_mxl[global_ch * Lmax + entry];
+        }
+        for (int ch = lane; ch < Pch; ch += kWarpLanes) {
+            int global_ch = chunk_id * Pch + ch;
+            cdf_sizes_cache[ch] = cdf_sizes_m[global_ch];
+            offsets_cache[ch] = offsets_m[global_ch];
+        }
+    } else {
+        if (lane == 0) {
+            int start_entry = 0;
+            for (int c = 0; c < C; ++c) {
+                cdf_starts_cache[c] = start_entry;
+                cdf_sizes_cache[c] = cdf_sizes_m[c];
+                offsets_cache[c] = offsets_m[c];
+                start_entry += cdf_sizes_m[c];
+            }
+        }
+        __syncwarp();
+        for (int c = 0; c < C; ++c) {
+            int cdf_size = cdf_sizes_cache[c];
+            int dst_start = cdf_starts_cache[c];
+            for (int entry = lane; entry < cdf_size; entry += kWarpLanes) {
+                cdf_cache[dst_start + entry] = cdfs_mxl[c * Lmax + entry];
+            }
+        }
     }
     __syncwarp();
 
@@ -131,8 +156,9 @@ __global__ void warp_encode_chunks_kernel_v3(
 
     if (first < end) {
         for (int i = last; i >= first; i -= kWarpLanes) {
-            int32_t cdf_idx  = fast_idx_is_channel ? (i / HW) : idx[i];
-            int32_t local_idx = cdf_idx - chunk_id * Pch;  // remap to [0, Pch)
+            int32_t cdf_idx = fast_idx_is_channel ? (i / HW) : idx[i];
+            int32_t local_idx = fast_idx_is_channel
+                ? cdf_idx - chunk_id * Pch : cdf_idx;
 
             const int32_t* cdf;
             int32_t cdf_size, offsetv;
@@ -140,9 +166,11 @@ __global__ void warp_encode_chunks_kernel_v3(
             if (local_idx == last_local_idx) {
                 cdf = last_cdf; cdf_size = last_cdf_size; offsetv = last_offsetv;
             } else {
-                cdf = cdf_cache + (int64_t)local_idx * Lmax;    // ← SHARED MEMORY
+                int cdf_start = fast_idx_is_channel
+                    ? local_idx * Lmax : cdf_starts_cache[local_idx];
+                cdf = cdf_cache + cdf_start;
                 cdf_size = cdf_sizes_cache[local_idx];
-                offsetv  = offsets_cache[local_idx];
+                offsetv = offsets_cache[local_idx];
                 last_local_idx = local_idx; last_cdf = cdf;
                 last_cdf_size = cdf_size; last_offsetv = offsetv;
             }
@@ -195,18 +223,22 @@ __global__ void warp_decode_chunks_kernel_v3(
     const int32_t* __restrict__ max_rounds_flat,
     int B, int K, int N, int chunk_len,
     const int32_t* __restrict__ indexes_bxn,
-    const int32_t* __restrict__ cdfs_mxl, int Lmax,
+    const int32_t* __restrict__ cdfs_mxl, int Lmax, int C,
     const int32_t* __restrict__ cdf_sizes_m,
     const int32_t* __restrict__ offsets_m,
+    int compact_cdf_entries,
     int32_t* __restrict__ out_symbols_bxn,
     int fast_idx_is_channel, int HW
 ) {
     extern __shared__ int32_t smem[];
-    int Pch = chunk_len / HW;
+    int Pch = fast_idx_is_channel ? chunk_len / HW : 0;
 
-    int32_t* cdf_cache       = smem;
-    int32_t* cdf_sizes_cache = smem + Pch * Lmax;
-    int32_t* offsets_cache   = cdf_sizes_cache + Pch;
+    int32_t* cdf_cache = smem;
+    int32_t* cdf_starts_cache = fast_idx_is_channel
+        ? nullptr : cdf_cache + compact_cdf_entries;
+    int32_t* cdf_sizes_cache = fast_idx_is_channel
+        ? cdf_cache + Pch * Lmax : cdf_starts_cache + C;
+    int32_t* offsets_cache = cdf_sizes_cache + (fast_idx_is_channel ? Pch : C);
 
     int b = (int)blockIdx.x;
     int chunk_id = (int)blockIdx.y;
@@ -223,17 +255,37 @@ __global__ void warp_decode_chunks_kernel_v3(
     if (end > N) end = N;
 
     // ---- Phase 1: cooperative load CDFs into shared memory ----
-    int total_entries = Pch * Lmax;
-    for (int idx = lane; idx < total_entries; idx += kWarpLanes) {
-        int ch = idx / Lmax;
-        int entry = idx % Lmax;
-        int global_ch = chunk_id * Pch + ch;
-        cdf_cache[idx] = cdfs_mxl[global_ch * Lmax + entry];
-    }
-    for (int ch = lane; ch < Pch; ch += kWarpLanes) {
-        int global_ch = chunk_id * Pch + ch;
-        cdf_sizes_cache[ch] = cdf_sizes_m[global_ch];
-        offsets_cache[ch]   = offsets_m[global_ch];
+    if (fast_idx_is_channel) {
+        int total_entries = Pch * Lmax;
+        for (int idx = lane; idx < total_entries; idx += kWarpLanes) {
+            int ch = idx / Lmax;
+            int entry = idx % Lmax;
+            int global_ch = chunk_id * Pch + ch;
+            cdf_cache[idx] = cdfs_mxl[global_ch * Lmax + entry];
+        }
+        for (int ch = lane; ch < Pch; ch += kWarpLanes) {
+            int global_ch = chunk_id * Pch + ch;
+            cdf_sizes_cache[ch] = cdf_sizes_m[global_ch];
+            offsets_cache[ch] = offsets_m[global_ch];
+        }
+    } else {
+        if (lane == 0) {
+            int start_entry = 0;
+            for (int c = 0; c < C; ++c) {
+                cdf_starts_cache[c] = start_entry;
+                cdf_sizes_cache[c] = cdf_sizes_m[c];
+                offsets_cache[c] = offsets_m[c];
+                start_entry += cdf_sizes_m[c];
+            }
+        }
+        __syncwarp();
+        for (int c = 0; c < C; ++c) {
+            int cdf_size = cdf_sizes_cache[c];
+            int dst_start = cdf_starts_cache[c];
+            for (int entry = lane; entry < cdf_size; entry += kWarpLanes) {
+                cdf_cache[dst_start + entry] = cdfs_mxl[c * Lmax + entry];
+            }
+        }
     }
     __syncwarp();
 
@@ -260,8 +312,9 @@ __global__ void warp_decode_chunks_kernel_v3(
 
     for (int s = 0; s < my_count; s++) {
         int i = start + lane + s * kWarpLanes;
-        int32_t cdf_idx  = fast_idx_is_channel ? (i / HW) : idx[i];
-        int32_t local_idx = cdf_idx - chunk_id * Pch;
+        int32_t cdf_idx = fast_idx_is_channel ? (i / HW) : idx[i];
+        int32_t local_idx = fast_idx_is_channel
+            ? cdf_idx - chunk_id * Pch : cdf_idx;
 
         const int32_t* cdf;
         int32_t cdf_size, max_value, offsetv;
@@ -269,10 +322,12 @@ __global__ void warp_decode_chunks_kernel_v3(
             cdf = last_cdf; cdf_size = last_cdf_size;
             max_value = last_max_value; offsetv = last_offsetv;
         } else {
-            cdf = cdf_cache + (int64_t)local_idx * Lmax;        // ← SHARED MEMORY
+            int cdf_start = fast_idx_is_channel
+                ? local_idx * Lmax : cdf_starts_cache[local_idx];
+            cdf = cdf_cache + cdf_start;
             cdf_size = cdf_sizes_cache[local_idx];
             max_value = cdf_size - 2;
-            offsetv  = offsets_cache[local_idx];
+            offsetv = offsets_cache[local_idx];
             last_local_idx = local_idx; last_cdf = cdf;
             last_cdf_size = cdf_size; last_max_value = max_value; last_offsetv = offsetv;
         }
@@ -334,24 +389,27 @@ std::vector<torch::Tensor> encode_with_indexes_warp_v3_cuda(
     auto opts_i32 = torch::TensorOptions().dtype(torch::kInt32).device(dev);
     auto opts_u32 = torch::TensorOptions().dtype(torch::kUInt32).device(dev);
 
-    // Fast-path detection — done in kernel, no CPU sync.
-    // EB/GC always produce channel-based indexes when N % C == 0.
-    int HW = 0, fast_idx_is_channel = 1;
+    int HW = 0, fast_idx_is_channel = 0;
     if (N % C == 0) {
         HW = N / C;
-    } else {
-        fast_idx_is_channel = 0;
+        auto flag = torch::ones({1}, opts_i32);
+        int t = 256, blk = (C + t - 1) / t;
+        check_idx_is_channel_kernel<<<blk, t, 0, stream>>>(
+            indexes_bxn.data_ptr<int32_t>(), N, C, HW, flag.data_ptr<int32_t>());
+        fast_idx_is_channel = flag.cpu().item<int32_t>();
     }
 
     int Pch = (int)P_in; if (Pch < 1) Pch = 1; if (Pch > C) Pch = C;
-
-    // Clamp Pch to fit shared memory budget (37 KB for CDF + sizes + offsets)
-    int maxPch = (37 * 1024) / (Lmax * 4 + 8);
-    if (Pch > maxPch) Pch = maxPch;
-    if (Pch < 1) Pch = 1;
+    if (fast_idx_is_channel) {
+        // Keep the existing low-shared-memory channel path.
+        int maxPch = (37 * 1024) / (Lmax * 4 + 8);
+        if (Pch > maxPch) Pch = maxPch;
+        if (Pch < 1) Pch = 1;
+    }
 
     int K = ceil_div(C, Pch);
-    int chunk_len = Pch * HW;
+    int chunk_len = fast_idx_is_channel
+        ? Pch * HW : ceil_div(N, K);
     int cap_words_per_lane = (chunk_len * 12 + 8) / kWarpLanes + 8;
     int cap_bytes_per_lane = cap_words_per_lane * 4;
 
@@ -392,14 +450,37 @@ std::vector<torch::Tensor> encode_with_indexes_warp_v3_cuda(
         torch::TensorOptions().dtype(torch::kUInt64)
     ).to(dev);
 
-    // Shared memory bytes for encode kernel
-    int smem_bytes = Pch * Lmax * 4 + Pch * 4 + Pch * 4;
+    int compact_cdf_entries = 0;
+    if (!fast_idx_is_channel) {
+        compact_cdf_entries = cdf_sizes_m.sum().to(torch::kCPU).item<int32_t>();
+    }
+    int smem_entries = fast_idx_is_channel
+        ? Pch * Lmax + 2 * Pch
+        : compact_cdf_entries + 3 * C;
+    int smem_bytes = smem_entries * (int)sizeof(int32_t);
+
+    int max_optin_smem = 0;
+    cudaDeviceGetAttribute(
+        &max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev.index());
+    TORCH_CHECK(
+        smem_bytes <= max_optin_smem,
+        "warp_smem CDF cache requires ", smem_bytes,
+        " bytes, but this GPU supports ", max_optin_smem,
+        " bytes of dynamic shared memory per block");
+    if (smem_bytes > 48 * 1024) {
+        auto err = cudaFuncSetAttribute(
+            warp_encode_chunks_kernel_v3,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_bytes);
+        TORCH_CHECK(err == cudaSuccess, "Failed to configure warp_smem encode kernel: ", cudaGetErrorString(err));
+    }
 
     // (1) V3 Encode — shared memory CDF cache
     warp_encode_chunks_kernel_v3<<<dim3(B, K, 1), kWarpLanes, smem_bytes, stream>>>(
         symbols_bxn.data_ptr<int32_t>(), indexes_bxn.data_ptr<int32_t>(),
-        B, N, cdfs_mxl.data_ptr<int32_t>(), Lmax,
+        B, N, cdfs_mxl.data_ptr<int32_t>(), Lmax, C,
         cdf_sizes_m.data_ptr<int32_t>(), offsets_m.data_ptr<int32_t>(),
+        compact_cdf_entries,
         K, chunk_len, HW, temp_arena_u8.data_ptr<uint8_t>(),
         arena_stride, temp_header_padded, cap_words_per_lane,
         lane_word_counts_flat.data_ptr<int32_t>(),
@@ -502,9 +583,31 @@ torch::Tensor decode_with_indexes_warp_v3_cuda(
         sizes_u32_flat.data_ptr<uint32_t>(),
         chunk_offsets_u32.data_ptr<uint32_t>(), B*K, stream.stream());
 
-    // Shared memory budget
-    int Pch = chunk_len / HW;
-    int smem_bytes = Pch * Lmax * 4 + Pch * 4 + Pch * 4;
+    int Pch = fast_idx_is_channel ? chunk_len / HW : 0;
+    int compact_cdf_entries = 0;
+    if (!fast_idx_is_channel) {
+        compact_cdf_entries = cdf_sizes_m.sum().to(torch::kCPU).item<int32_t>();
+    }
+    int smem_entries = fast_idx_is_channel
+        ? Pch * Lmax + 2 * Pch
+        : compact_cdf_entries + 3 * C;
+    int smem_bytes = smem_entries * (int)sizeof(int32_t);
+
+    int max_optin_smem = 0;
+    cudaDeviceGetAttribute(
+        &max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev.index());
+    TORCH_CHECK(
+        smem_bytes <= max_optin_smem,
+        "warp_smem CDF cache requires ", smem_bytes,
+        " bytes, but this GPU supports ", max_optin_smem,
+        " bytes of dynamic shared memory per block");
+    if (smem_bytes > 48 * 1024) {
+        auto err = cudaFuncSetAttribute(
+            warp_decode_chunks_kernel_v3,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_bytes);
+        TORCH_CHECK(err == cudaSuccess, "Failed to configure warp_smem decode kernel: ", cudaGetErrorString(err));
+    }
 
     auto out = torch::empty({B, N}, opts_i32);
     warp_decode_chunks_kernel_v3<<<dim3(B, K, 1), kWarpLanes, smem_bytes, stream>>>(
@@ -513,8 +616,9 @@ torch::Tensor decode_with_indexes_warp_v3_cuda(
         max_rounds_i32.data_ptr<int32_t>(),
         B, K, N, chunk_len,
         indexes_bxn.data_ptr<int32_t>(),
-        cdfs_mxl.data_ptr<int32_t>(), Lmax,
+        cdfs_mxl.data_ptr<int32_t>(), Lmax, C,
         cdf_sizes_m.data_ptr<int32_t>(), offsets_m.data_ptr<int32_t>(),
+        compact_cdf_entries,
         out.data_ptr<int32_t>(), fast_idx_is_channel, HW);
 
     return out;
